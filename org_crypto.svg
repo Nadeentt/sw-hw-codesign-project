@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="1050" onload="init(evt)" viewBox="0 0 1200 1050" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = true;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="1050" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">py-spy record --rate 100 --duration 10 --format=flamegraph -o org_crypto.svg -- python3 profile_wrapper.py</text><text id="details" fill="rgb(0,0,0)" x="10" y="40.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="1039.00"> </text><svg id="frames" x="10" width="1180" total_samples="998"><g><title>&lt;module&gt; (run_benchmark.py:10) (1 samples, 0.10%)</title><rect x="0.0000%" y="164" width="0.1002%" height="15" fill="rgb(227,0,7)" fg:x="0" fg:w="1"/><text x="0.2500%" y="174.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.0000%" y="180" width="0.1002%" height="15" fill="rgb(217,0,24)" fg:x="0" fg:w="1"/><text x="0.2500%" y="190.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.0000%" y="196" width="0.1002%" height="15" fill="rgb(221,193,54)" fg:x="0" fg:w="1"/><text x="0.2500%" y="206.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.0000%" y="212" width="0.1002%" height="15" fill="rgb(248,212,6)" fg:x="0" fg:w="1"/><text x="0.2500%" y="222.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.0000%" y="228" width="0.1002%" height="15" fill="rgb(208,68,35)" fg:x="0" fg:w="1"/><text x="0.2500%" y="238.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.0000%" y="244" width="0.1002%" height="15" fill="rgb(232,128,0)" fg:x="0" fg:w="1"/><text x="0.2500%" y="254.50"></text></g><g><title>&lt;module&gt; (pyaes/__init__.py:52) (1 samples, 0.10%)</title><rect x="0.0000%" y="260" width="0.1002%" height="15" fill="rgb(207,160,47)" fg:x="0" fg:w="1"/><text x="0.2500%" y="270.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.0000%" y="276" width="0.1002%" height="15" fill="rgb(228,23,34)" fg:x="0" fg:w="1"/><text x="0.2500%" y="286.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.0000%" y="292" width="0.1002%" height="15" fill="rgb(218,30,26)" fg:x="0" fg:w="1"/><text x="0.2500%" y="302.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.0000%" y="308" width="0.1002%" height="15" fill="rgb(220,122,19)" fg:x="0" fg:w="1"/><text x="0.2500%" y="318.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:879) (1 samples, 0.10%)</title><rect x="0.0000%" y="324" width="0.1002%" height="15" fill="rgb(250,228,42)" fg:x="0" fg:w="1"/><text x="0.2500%" y="334.50"></text></g><g><title>get_code (&lt;frozen importlib._bootstrap_external&gt;:984) (1 samples, 0.10%)</title><rect x="0.0000%" y="340" width="0.1002%" height="15" fill="rgb(240,193,28)" fg:x="0" fg:w="1"/><text x="0.2500%" y="350.50"></text></g><g><title>_classify_pyc (&lt;frozen importlib._bootstrap_external&gt;:610) (1 samples, 0.10%)</title><rect x="0.0000%" y="356" width="0.1002%" height="15" fill="rgb(216,20,37)" fg:x="0" fg:w="1"/><text x="0.2500%" y="366.50"></text></g><g><title>_unpack_uint32 (&lt;frozen importlib._bootstrap_external&gt;:87) (1 samples, 0.10%)</title><rect x="0.0000%" y="372" width="0.1002%" height="15" fill="rgb(206,188,39)" fg:x="0" fg:w="1"/><text x="0.2500%" y="382.50"></text></g><g><title>&lt;module&gt; (psutil/__init__.py:27) (1 samples, 0.10%)</title><rect x="0.1002%" y="548" width="0.1002%" height="15" fill="rgb(217,207,13)" fg:x="1" fg:w="1"/><text x="0.3502%" y="558.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.1002%" y="564" width="0.1002%" height="15" fill="rgb(231,73,38)" fg:x="1" fg:w="1"/><text x="0.3502%" y="574.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.1002%" y="580" width="0.1002%" height="15" fill="rgb(225,20,46)" fg:x="1" fg:w="1"/><text x="0.3502%" y="590.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.1002%" y="596" width="0.1002%" height="15" fill="rgb(210,31,41)" fg:x="1" fg:w="1"/><text x="0.3502%" y="606.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.1002%" y="612" width="0.1002%" height="15" fill="rgb(221,200,47)" fg:x="1" fg:w="1"/><text x="0.3502%" y="622.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.1002%" y="628" width="0.1002%" height="15" fill="rgb(226,26,5)" fg:x="1" fg:w="1"/><text x="0.3502%" y="638.50"></text></g><g><title>&lt;module&gt; (socket.py:80) (1 samples, 0.10%)</title><rect x="0.1002%" y="644" width="0.1002%" height="15" fill="rgb(249,33,26)" fg:x="1" fg:w="1"/><text x="0.3502%" y="654.50"></text></g><g><title>_convert_ (enum.py:563) (1 samples, 0.10%)</title><rect x="0.1002%" y="660" width="0.1002%" height="15" fill="rgb(235,183,28)" fg:x="1" fg:w="1"/><text x="0.3502%" y="670.50"></text></g><g><title>__call__ (enum.py:387) (1 samples, 0.10%)</title><rect x="0.1002%" y="676" width="0.1002%" height="15" fill="rgb(221,5,38)" fg:x="1" fg:w="1"/><text x="0.3502%" y="686.50"></text></g><g><title>_create_ (enum.py:518) (1 samples, 0.10%)</title><rect x="0.1002%" y="692" width="0.1002%" height="15" fill="rgb(247,18,42)" fg:x="1" fg:w="1"/><text x="0.3502%" y="702.50"></text></g><g><title>__new__ (enum.py:218) (1 samples, 0.10%)</title><rect x="0.1002%" y="708" width="0.1002%" height="15" fill="rgb(241,131,45)" fg:x="1" fg:w="1"/><text x="0.3502%" y="718.50"></text></g><g><title>&lt;module&gt; (psutil/__init__.py:28) (1 samples, 0.10%)</title><rect x="0.2004%" y="548" width="0.1002%" height="15" fill="rgb(249,31,29)" fg:x="2" fg:w="1"/><text x="0.4504%" y="558.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.2004%" y="564" width="0.1002%" height="15" fill="rgb(225,111,53)" fg:x="2" fg:w="1"/><text x="0.4504%" y="574.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.2004%" y="580" width="0.1002%" height="15" fill="rgb(238,160,17)" fg:x="2" fg:w="1"/><text x="0.4504%" y="590.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.2004%" y="596" width="0.1002%" height="15" fill="rgb(214,148,48)" fg:x="2" fg:w="1"/><text x="0.4504%" y="606.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.2004%" y="612" width="0.1002%" height="15" fill="rgb(232,36,49)" fg:x="2" fg:w="1"/><text x="0.4504%" y="622.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.2004%" y="628" width="0.1002%" height="15" fill="rgb(209,103,24)" fg:x="2" fg:w="1"/><text x="0.4504%" y="638.50"></text></g><g><title>&lt;module&gt; (subprocess.py:50) (1 samples, 0.10%)</title><rect x="0.2004%" y="644" width="0.1002%" height="15" fill="rgb(229,88,8)" fg:x="2" fg:w="1"/><text x="0.4504%" y="654.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.2004%" y="660" width="0.1002%" height="15" fill="rgb(213,181,19)" fg:x="2" fg:w="1"/><text x="0.4504%" y="670.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.2004%" y="676" width="0.1002%" height="15" fill="rgb(254,191,54)" fg:x="2" fg:w="1"/><text x="0.4504%" y="686.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.2004%" y="692" width="0.1002%" height="15" fill="rgb(241,83,37)" fg:x="2" fg:w="1"/><text x="0.4504%" y="702.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.2004%" y="708" width="0.1002%" height="15" fill="rgb(233,36,39)" fg:x="2" fg:w="1"/><text x="0.4504%" y="718.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.2004%" y="724" width="0.1002%" height="15" fill="rgb(226,3,54)" fg:x="2" fg:w="1"/><text x="0.4504%" y="734.50"></text></g><g><title>&lt;module&gt; (threading.py:9) (1 samples, 0.10%)</title><rect x="0.2004%" y="740" width="0.1002%" height="15" fill="rgb(245,192,40)" fg:x="2" fg:w="1"/><text x="0.4504%" y="750.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.2004%" y="756" width="0.1002%" height="15" fill="rgb(238,167,29)" fg:x="2" fg:w="1"/><text x="0.4504%" y="766.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.2004%" y="772" width="0.1002%" height="15" fill="rgb(232,182,51)" fg:x="2" fg:w="1"/><text x="0.4504%" y="782.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.2004%" y="788" width="0.1002%" height="15" fill="rgb(231,60,39)" fg:x="2" fg:w="1"/><text x="0.4504%" y="798.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:879) (1 samples, 0.10%)</title><rect x="0.2004%" y="804" width="0.1002%" height="15" fill="rgb(208,69,12)" fg:x="2" fg:w="1"/><text x="0.4504%" y="814.50"></text></g><g><title>get_code (&lt;frozen importlib._bootstrap_external&gt;:984) (1 samples, 0.10%)</title><rect x="0.2004%" y="820" width="0.1002%" height="15" fill="rgb(235,93,37)" fg:x="2" fg:w="1"/><text x="0.4504%" y="830.50"></text></g><g><title>_classify_pyc (&lt;frozen importlib._bootstrap_external&gt;:601) (1 samples, 0.10%)</title><rect x="0.2004%" y="836" width="0.1002%" height="15" fill="rgb(213,116,39)" fg:x="2" fg:w="1"/><text x="0.4504%" y="846.50"></text></g><g><title>&lt;module&gt; (psutil/_pslinux.py:158) (1 samples, 0.10%)</title><rect x="0.3006%" y="676" width="0.1002%" height="15" fill="rgb(222,207,29)" fg:x="3" fg:w="1"/><text x="0.5506%" y="686.50"></text></g><g><title>namedtuple (collections/__init__.py:414) (1 samples, 0.10%)</title><rect x="0.3006%" y="692" width="0.1002%" height="15" fill="rgb(206,96,30)" fg:x="3" fg:w="1"/><text x="0.5506%" y="702.50"></text></g><g><title>&lt;module&gt; (psutil/_pslinux.py:162) (1 samples, 0.10%)</title><rect x="0.4008%" y="676" width="0.1002%" height="15" fill="rgb(218,138,4)" fg:x="4" fg:w="1"/><text x="0.6508%" y="686.50"></text></g><g><title>namedtuple (collections/__init__.py:421) (1 samples, 0.10%)</title><rect x="0.4008%" y="692" width="0.1002%" height="15" fill="rgb(250,191,14)" fg:x="4" fg:w="1"/><text x="0.6508%" y="702.50"></text></g><g><title>&lt;module&gt; (pyperf/_runner.py:10) (5 samples, 0.50%)</title><rect x="0.1002%" y="356" width="0.5010%" height="15" fill="rgb(239,60,40)" fg:x="1" fg:w="5"/><text x="0.3502%" y="366.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (5 samples, 0.50%)</title><rect x="0.1002%" y="372" width="0.5010%" height="15" fill="rgb(206,27,48)" fg:x="1" fg:w="5"/><text x="0.3502%" y="382.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (5 samples, 0.50%)</title><rect x="0.1002%" y="388" width="0.5010%" height="15" fill="rgb(225,35,8)" fg:x="1" fg:w="5"/><text x="0.3502%" y="398.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (5 samples, 0.50%)</title><rect x="0.1002%" y="404" width="0.5010%" height="15" fill="rgb(250,213,24)" fg:x="1" fg:w="5"/><text x="0.3502%" y="414.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (5 samples, 0.50%)</title><rect x="0.1002%" y="420" width="0.5010%" height="15" fill="rgb(247,123,22)" fg:x="1" fg:w="5"/><text x="0.3502%" y="430.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (5 samples, 0.50%)</title><rect x="0.1002%" y="436" width="0.5010%" height="15" fill="rgb(231,138,38)" fg:x="1" fg:w="5"/><text x="0.3502%" y="446.50"></text></g><g><title>&lt;module&gt; (pyperf/_cpu_utils.py:11) (5 samples, 0.50%)</title><rect x="0.1002%" y="452" width="0.5010%" height="15" fill="rgb(231,145,46)" fg:x="1" fg:w="5"/><text x="0.3502%" y="462.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (5 samples, 0.50%)</title><rect x="0.1002%" y="468" width="0.5010%" height="15" fill="rgb(251,118,11)" fg:x="1" fg:w="5"/><text x="0.3502%" y="478.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (5 samples, 0.50%)</title><rect x="0.1002%" y="484" width="0.5010%" height="15" fill="rgb(217,147,25)" fg:x="1" fg:w="5"/><text x="0.3502%" y="494.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (5 samples, 0.50%)</title><rect x="0.1002%" y="500" width="0.5010%" height="15" fill="rgb(247,81,37)" fg:x="1" fg:w="5"/><text x="0.3502%" y="510.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (5 samples, 0.50%)</title><rect x="0.1002%" y="516" width="0.5010%" height="15" fill="rgb(209,12,38)" fg:x="1" fg:w="5"/><text x="0.3502%" y="526.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (5 samples, 0.50%)</title><rect x="0.1002%" y="532" width="0.5010%" height="15" fill="rgb(227,1,9)" fg:x="1" fg:w="5"/><text x="0.3502%" y="542.50"></text></g><g><title>&lt;module&gt; (psutil/__init__.py:95) (3 samples, 0.30%)</title><rect x="0.3006%" y="548" width="0.3006%" height="15" fill="rgb(248,47,43)" fg:x="3" fg:w="3"/><text x="0.5506%" y="558.50"></text></g><g><title>_handle_fromlist (&lt;frozen importlib._bootstrap&gt;:1078) (3 samples, 0.30%)</title><rect x="0.3006%" y="564" width="0.3006%" height="15" fill="rgb(221,10,30)" fg:x="3" fg:w="3"/><text x="0.5506%" y="574.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (3 samples, 0.30%)</title><rect x="0.3006%" y="580" width="0.3006%" height="15" fill="rgb(210,229,1)" fg:x="3" fg:w="3"/><text x="0.5506%" y="590.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (3 samples, 0.30%)</title><rect x="0.3006%" y="596" width="0.3006%" height="15" fill="rgb(222,148,37)" fg:x="3" fg:w="3"/><text x="0.5506%" y="606.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (3 samples, 0.30%)</title><rect x="0.3006%" y="612" width="0.3006%" height="15" fill="rgb(234,67,33)" fg:x="3" fg:w="3"/><text x="0.5506%" y="622.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (3 samples, 0.30%)</title><rect x="0.3006%" y="628" width="0.3006%" height="15" fill="rgb(247,98,35)" fg:x="3" fg:w="3"/><text x="0.5506%" y="638.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (3 samples, 0.30%)</title><rect x="0.3006%" y="644" width="0.3006%" height="15" fill="rgb(247,138,52)" fg:x="3" fg:w="3"/><text x="0.5506%" y="654.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (3 samples, 0.30%)</title><rect x="0.3006%" y="660" width="0.3006%" height="15" fill="rgb(213,79,30)" fg:x="3" fg:w="3"/><text x="0.5506%" y="670.50"></text></g><g><title>&lt;module&gt; (psutil/_pslinux.py:26) (1 samples, 0.10%)</title><rect x="0.5010%" y="676" width="0.1002%" height="15" fill="rgb(246,177,23)" fg:x="5" fg:w="1"/><text x="0.7510%" y="686.50"></text></g><g><title>_handle_fromlist (&lt;frozen importlib._bootstrap&gt;:1078) (1 samples, 0.10%)</title><rect x="0.5010%" y="692" width="0.1002%" height="15" fill="rgb(230,62,27)" fg:x="5" fg:w="1"/><text x="0.7510%" y="702.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.5010%" y="708" width="0.1002%" height="15" fill="rgb(216,154,8)" fg:x="5" fg:w="1"/><text x="0.7510%" y="718.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.5010%" y="724" width="0.1002%" height="15" fill="rgb(244,35,45)" fg:x="5" fg:w="1"/><text x="0.7510%" y="734.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.5010%" y="740" width="0.1002%" height="15" fill="rgb(251,115,12)" fg:x="5" fg:w="1"/><text x="0.7510%" y="750.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:674) (1 samples, 0.10%)</title><rect x="0.5010%" y="756" width="0.1002%" height="15" fill="rgb(240,54,50)" fg:x="5" fg:w="1"/><text x="0.7510%" y="766.50"></text></g><g><title>module_from_spec (&lt;frozen importlib._bootstrap&gt;:577) (1 samples, 0.10%)</title><rect x="0.5010%" y="772" width="0.1002%" height="15" fill="rgb(233,84,52)" fg:x="5" fg:w="1"/><text x="0.7510%" y="782.50"></text></g><g><title>_init_module_attrs (&lt;frozen importlib._bootstrap&gt;:526) (1 samples, 0.10%)</title><rect x="0.5010%" y="788" width="0.1002%" height="15" fill="rgb(207,117,47)" fg:x="5" fg:w="1"/><text x="0.7510%" y="798.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1024) (1 samples, 0.10%)</title><rect x="0.6012%" y="372" width="0.1002%" height="15" fill="rgb(249,43,39)" fg:x="6" fg:w="1"/><text x="0.8512%" y="382.50"></text></g><g><title>&lt;module&gt; (pyperf/_hooks.py:13) (1 samples, 0.10%)</title><rect x="0.7014%" y="452" width="0.1002%" height="15" fill="rgb(209,38,44)" fg:x="7" fg:w="1"/><text x="0.9514%" y="462.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.7014%" y="468" width="0.1002%" height="15" fill="rgb(236,212,23)" fg:x="7" fg:w="1"/><text x="0.9514%" y="478.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.7014%" y="484" width="0.1002%" height="15" fill="rgb(242,79,21)" fg:x="7" fg:w="1"/><text x="0.9514%" y="494.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.7014%" y="500" width="0.1002%" height="15" fill="rgb(211,96,35)" fg:x="7" fg:w="1"/><text x="0.9514%" y="510.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.7014%" y="516" width="0.1002%" height="15" fill="rgb(253,215,40)" fg:x="7" fg:w="1"/><text x="0.9514%" y="526.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.7014%" y="532" width="0.1002%" height="15" fill="rgb(211,81,21)" fg:x="7" fg:w="1"/><text x="0.9514%" y="542.50"></text></g><g><title>&lt;module&gt; (uuid.py:59) (1 samples, 0.10%)</title><rect x="0.7014%" y="548" width="0.1002%" height="15" fill="rgb(208,190,38)" fg:x="7" fg:w="1"/><text x="0.9514%" y="558.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.7014%" y="564" width="0.1002%" height="15" fill="rgb(235,213,38)" fg:x="7" fg:w="1"/><text x="0.9514%" y="574.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.7014%" y="580" width="0.1002%" height="15" fill="rgb(237,122,38)" fg:x="7" fg:w="1"/><text x="0.9514%" y="590.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.7014%" y="596" width="0.1002%" height="15" fill="rgb(244,218,35)" fg:x="7" fg:w="1"/><text x="0.9514%" y="606.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.7014%" y="612" width="0.1002%" height="15" fill="rgb(240,68,47)" fg:x="7" fg:w="1"/><text x="0.9514%" y="622.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.7014%" y="628" width="0.1002%" height="15" fill="rgb(210,16,53)" fg:x="7" fg:w="1"/><text x="0.9514%" y="638.50"></text></g><g><title>&lt;module&gt; (platform.py:156) (1 samples, 0.10%)</title><rect x="0.7014%" y="644" width="0.1002%" height="15" fill="rgb(235,124,12)" fg:x="7" fg:w="1"/><text x="0.9514%" y="654.50"></text></g><g><title>compile (re.py:251) (1 samples, 0.10%)</title><rect x="0.7014%" y="660" width="0.1002%" height="15" fill="rgb(224,169,11)" fg:x="7" fg:w="1"/><text x="0.9514%" y="670.50"></text></g><g><title>_compile (re.py:303) (1 samples, 0.10%)</title><rect x="0.7014%" y="676" width="0.1002%" height="15" fill="rgb(250,166,2)" fg:x="7" fg:w="1"/><text x="0.9514%" y="686.50"></text></g><g><title>compile (sre_compile.py:792) (1 samples, 0.10%)</title><rect x="0.7014%" y="692" width="0.1002%" height="15" fill="rgb(242,216,29)" fg:x="7" fg:w="1"/><text x="0.9514%" y="702.50"></text></g><g><title>_code (sre_compile.py:631) (1 samples, 0.10%)</title><rect x="0.7014%" y="708" width="0.1002%" height="15" fill="rgb(230,116,27)" fg:x="7" fg:w="1"/><text x="0.9514%" y="718.50"></text></g><g><title>_compile (sre_compile.py:225) (1 samples, 0.10%)</title><rect x="0.7014%" y="724" width="0.1002%" height="15" fill="rgb(228,99,48)" fg:x="7" fg:w="1"/><text x="0.9514%" y="734.50"></text></g><g><title>_compile (sre_compile.py:184) (1 samples, 0.10%)</title><rect x="0.7014%" y="740" width="0.1002%" height="15" fill="rgb(253,11,6)" fg:x="7" fg:w="1"/><text x="0.9514%" y="750.50"></text></g><g><title>_compile (sre_compile.py:172) (1 samples, 0.10%)</title><rect x="0.7014%" y="756" width="0.1002%" height="15" fill="rgb(247,143,39)" fg:x="7" fg:w="1"/><text x="0.9514%" y="766.50"></text></g><g><title>_compile (sre_compile.py:184) (1 samples, 0.10%)</title><rect x="0.7014%" y="772" width="0.1002%" height="15" fill="rgb(236,97,10)" fg:x="7" fg:w="1"/><text x="0.9514%" y="782.50"></text></g><g><title>_compile (sre_compile.py:164) (1 samples, 0.10%)</title><rect x="0.7014%" y="788" width="0.1002%" height="15" fill="rgb(233,208,19)" fg:x="7" fg:w="1"/><text x="0.9514%" y="798.50"></text></g><g><title>_compile (sre_compile.py:146) (1 samples, 0.10%)</title><rect x="0.7014%" y="804" width="0.1002%" height="15" fill="rgb(216,164,2)" fg:x="7" fg:w="1"/><text x="0.9514%" y="814.50"></text></g><g><title>_compile_charset (sre_compile.py:272) (1 samples, 0.10%)</title><rect x="0.7014%" y="820" width="0.1002%" height="15" fill="rgb(220,129,5)" fg:x="7" fg:w="1"/><text x="0.9514%" y="830.50"></text></g><g><title>&lt;module&gt; (importlib/metadata/__init__.py:17) (1 samples, 0.10%)</title><rect x="0.8016%" y="548" width="0.1002%" height="15" fill="rgb(242,17,10)" fg:x="8" fg:w="1"/><text x="1.0516%" y="558.50"></text></g><g><title>_handle_fromlist (&lt;frozen importlib._bootstrap&gt;:1078) (1 samples, 0.10%)</title><rect x="0.8016%" y="564" width="0.1002%" height="15" fill="rgb(242,107,0)" fg:x="8" fg:w="1"/><text x="1.0516%" y="574.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.8016%" y="580" width="0.1002%" height="15" fill="rgb(251,28,31)" fg:x="8" fg:w="1"/><text x="1.0516%" y="590.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.8016%" y="596" width="0.1002%" height="15" fill="rgb(233,223,10)" fg:x="8" fg:w="1"/><text x="1.0516%" y="606.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.8016%" y="612" width="0.1002%" height="15" fill="rgb(215,21,27)" fg:x="8" fg:w="1"/><text x="1.0516%" y="622.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.8016%" y="628" width="0.1002%" height="15" fill="rgb(232,23,21)" fg:x="8" fg:w="1"/><text x="1.0516%" y="638.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.8016%" y="644" width="0.1002%" height="15" fill="rgb(244,5,23)" fg:x="8" fg:w="1"/><text x="1.0516%" y="654.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.8016%" y="660" width="0.1002%" height="15" fill="rgb(226,81,46)" fg:x="8" fg:w="1"/><text x="1.0516%" y="670.50"></text></g><g><title>&lt;module&gt; (importlib/metadata/_adapters.py:3) (1 samples, 0.10%)</title><rect x="0.8016%" y="676" width="0.1002%" height="15" fill="rgb(247,70,30)" fg:x="8" fg:w="1"/><text x="1.0516%" y="686.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.8016%" y="692" width="0.1002%" height="15" fill="rgb(212,68,19)" fg:x="8" fg:w="1"/><text x="1.0516%" y="702.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.8016%" y="708" width="0.1002%" height="15" fill="rgb(240,187,13)" fg:x="8" fg:w="1"/><text x="1.0516%" y="718.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.8016%" y="724" width="0.1002%" height="15" fill="rgb(223,113,26)" fg:x="8" fg:w="1"/><text x="1.0516%" y="734.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.8016%" y="740" width="0.1002%" height="15" fill="rgb(206,192,2)" fg:x="8" fg:w="1"/><text x="1.0516%" y="750.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.8016%" y="756" width="0.1002%" height="15" fill="rgb(241,108,4)" fg:x="8" fg:w="1"/><text x="1.0516%" y="766.50"></text></g><g><title>&lt;module&gt; (email/message.py:15) (1 samples, 0.10%)</title><rect x="0.8016%" y="772" width="0.1002%" height="15" fill="rgb(247,173,49)" fg:x="8" fg:w="1"/><text x="1.0516%" y="782.50"></text></g><g><title>_handle_fromlist (&lt;frozen importlib._bootstrap&gt;:1078) (1 samples, 0.10%)</title><rect x="0.8016%" y="788" width="0.1002%" height="15" fill="rgb(224,114,35)" fg:x="8" fg:w="1"/><text x="1.0516%" y="798.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.8016%" y="804" width="0.1002%" height="15" fill="rgb(245,159,27)" fg:x="8" fg:w="1"/><text x="1.0516%" y="814.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.8016%" y="820" width="0.1002%" height="15" fill="rgb(245,172,44)" fg:x="8" fg:w="1"/><text x="1.0516%" y="830.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.8016%" y="836" width="0.1002%" height="15" fill="rgb(236,23,11)" fg:x="8" fg:w="1"/><text x="1.0516%" y="846.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.8016%" y="852" width="0.1002%" height="15" fill="rgb(205,117,38)" fg:x="8" fg:w="1"/><text x="1.0516%" y="862.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.8016%" y="868" width="0.1002%" height="15" fill="rgb(237,72,25)" fg:x="8" fg:w="1"/><text x="1.0516%" y="878.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.8016%" y="884" width="0.1002%" height="15" fill="rgb(244,70,9)" fg:x="8" fg:w="1"/><text x="1.0516%" y="894.50"></text></g><g><title>&lt;module&gt; (email/utils.py:390) (1 samples, 0.10%)</title><rect x="0.8016%" y="900" width="0.1002%" height="15" fill="rgb(217,125,39)" fg:x="8" fg:w="1"/><text x="1.0516%" y="910.50"></text></g><g><title>compile (re.py:251) (1 samples, 0.10%)</title><rect x="0.8016%" y="916" width="0.1002%" height="15" fill="rgb(235,36,10)" fg:x="8" fg:w="1"/><text x="1.0516%" y="926.50"></text></g><g><title>_compile (re.py:303) (1 samples, 0.10%)</title><rect x="0.8016%" y="932" width="0.1002%" height="15" fill="rgb(251,123,47)" fg:x="8" fg:w="1"/><text x="1.0516%" y="942.50"></text></g><g><title>compile (sre_compile.py:788) (1 samples, 0.10%)</title><rect x="0.8016%" y="948" width="0.1002%" height="15" fill="rgb(221,13,13)" fg:x="8" fg:w="1"/><text x="1.0516%" y="958.50"></text></g><g><title>parse (sre_parse.py:955) (1 samples, 0.10%)</title><rect x="0.8016%" y="964" width="0.1002%" height="15" fill="rgb(238,131,9)" fg:x="8" fg:w="1"/><text x="1.0516%" y="974.50"></text></g><g><title>_parse_sub (sre_parse.py:444) (1 samples, 0.10%)</title><rect x="0.8016%" y="980" width="0.1002%" height="15" fill="rgb(211,50,8)" fg:x="8" fg:w="1"/><text x="1.0516%" y="990.50"></text></g><g><title>_parse (sre_parse.py:512) (1 samples, 0.10%)</title><rect x="0.8016%" y="996" width="0.1002%" height="15" fill="rgb(245,182,24)" fg:x="8" fg:w="1"/><text x="1.0516%" y="1006.50"></text></g><g><title>get (sre_parse.py:257) (1 samples, 0.10%)</title><rect x="0.8016%" y="1012" width="0.1002%" height="15" fill="rgb(242,14,37)" fg:x="8" fg:w="1"/><text x="1.0516%" y="1022.50"></text></g><g><title>&lt;module&gt; (profile_wrapper.py:1) (10 samples, 1.00%)</title><rect x="0.0000%" y="68" width="1.0020%" height="15" fill="rgb(246,228,12)" fg:x="0" fg:w="10"/><text x="0.2500%" y="78.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (10 samples, 1.00%)</title><rect x="0.0000%" y="84" width="1.0020%" height="15" fill="rgb(213,55,15)" fg:x="0" fg:w="10"/><text x="0.2500%" y="94.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (10 samples, 1.00%)</title><rect x="0.0000%" y="100" width="1.0020%" height="15" fill="rgb(209,9,3)" fg:x="0" fg:w="10"/><text x="0.2500%" y="110.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (10 samples, 1.00%)</title><rect x="0.0000%" y="116" width="1.0020%" height="15" fill="rgb(230,59,30)" fg:x="0" fg:w="10"/><text x="0.2500%" y="126.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (10 samples, 1.00%)</title><rect x="0.0000%" y="132" width="1.0020%" height="15" fill="rgb(209,121,21)" fg:x="0" fg:w="10"/><text x="0.2500%" y="142.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (10 samples, 1.00%)</title><rect x="0.0000%" y="148" width="1.0020%" height="15" fill="rgb(220,109,13)" fg:x="0" fg:w="10"/><text x="0.2500%" y="158.50"></text></g><g><title>&lt;module&gt; (run_benchmark.py:8) (9 samples, 0.90%)</title><rect x="0.1002%" y="164" width="0.9018%" height="15" fill="rgb(232,18,1)" fg:x="1" fg:w="9"/><text x="0.3502%" y="174.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (9 samples, 0.90%)</title><rect x="0.1002%" y="180" width="0.9018%" height="15" fill="rgb(215,41,42)" fg:x="1" fg:w="9"/><text x="0.3502%" y="190.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (9 samples, 0.90%)</title><rect x="0.1002%" y="196" width="0.9018%" height="15" fill="rgb(224,123,36)" fg:x="1" fg:w="9"/><text x="0.3502%" y="206.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (9 samples, 0.90%)</title><rect x="0.1002%" y="212" width="0.9018%" height="15" fill="rgb(240,125,3)" fg:x="1" fg:w="9"/><text x="0.3502%" y="222.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (9 samples, 0.90%)</title><rect x="0.1002%" y="228" width="0.9018%" height="15" fill="rgb(205,98,50)" fg:x="1" fg:w="9"/><text x="0.3502%" y="238.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (9 samples, 0.90%)</title><rect x="0.1002%" y="244" width="0.9018%" height="15" fill="rgb(205,185,37)" fg:x="1" fg:w="9"/><text x="0.3502%" y="254.50"></text></g><g><title>&lt;module&gt; (pyperf/__init__.py:19) (9 samples, 0.90%)</title><rect x="0.1002%" y="260" width="0.9018%" height="15" fill="rgb(238,207,15)" fg:x="1" fg:w="9"/><text x="0.3502%" y="270.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (9 samples, 0.90%)</title><rect x="0.1002%" y="276" width="0.9018%" height="15" fill="rgb(213,199,42)" fg:x="1" fg:w="9"/><text x="0.3502%" y="286.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (9 samples, 0.90%)</title><rect x="0.1002%" y="292" width="0.9018%" height="15" fill="rgb(235,201,11)" fg:x="1" fg:w="9"/><text x="0.3502%" y="302.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (9 samples, 0.90%)</title><rect x="0.1002%" y="308" width="0.9018%" height="15" fill="rgb(207,46,11)" fg:x="1" fg:w="9"/><text x="0.3502%" y="318.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (9 samples, 0.90%)</title><rect x="0.1002%" y="324" width="0.9018%" height="15" fill="rgb(241,35,35)" fg:x="1" fg:w="9"/><text x="0.3502%" y="334.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (9 samples, 0.90%)</title><rect x="0.1002%" y="340" width="0.9018%" height="15" fill="rgb(243,32,47)" fg:x="1" fg:w="9"/><text x="0.3502%" y="350.50"></text></g><g><title>&lt;module&gt; (pyperf/_runner.py:14) (4 samples, 0.40%)</title><rect x="0.6012%" y="356" width="0.4008%" height="15" fill="rgb(247,202,23)" fg:x="6" fg:w="4"/><text x="0.8512%" y="366.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (3 samples, 0.30%)</title><rect x="0.7014%" y="372" width="0.3006%" height="15" fill="rgb(219,102,11)" fg:x="7" fg:w="3"/><text x="0.9514%" y="382.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (3 samples, 0.30%)</title><rect x="0.7014%" y="388" width="0.3006%" height="15" fill="rgb(243,110,44)" fg:x="7" fg:w="3"/><text x="0.9514%" y="398.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (3 samples, 0.30%)</title><rect x="0.7014%" y="404" width="0.3006%" height="15" fill="rgb(222,74,54)" fg:x="7" fg:w="3"/><text x="0.9514%" y="414.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (3 samples, 0.30%)</title><rect x="0.7014%" y="420" width="0.3006%" height="15" fill="rgb(216,99,12)" fg:x="7" fg:w="3"/><text x="0.9514%" y="430.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (3 samples, 0.30%)</title><rect x="0.7014%" y="436" width="0.3006%" height="15" fill="rgb(226,22,26)" fg:x="7" fg:w="3"/><text x="0.9514%" y="446.50"></text></g><g><title>&lt;module&gt; (pyperf/_hooks.py:7) (2 samples, 0.20%)</title><rect x="0.8016%" y="452" width="0.2004%" height="15" fill="rgb(217,163,10)" fg:x="8" fg:w="2"/><text x="1.0516%" y="462.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (2 samples, 0.20%)</title><rect x="0.8016%" y="468" width="0.2004%" height="15" fill="rgb(213,25,53)" fg:x="8" fg:w="2"/><text x="1.0516%" y="478.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (2 samples, 0.20%)</title><rect x="0.8016%" y="484" width="0.2004%" height="15" fill="rgb(252,105,26)" fg:x="8" fg:w="2"/><text x="1.0516%" y="494.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (2 samples, 0.20%)</title><rect x="0.8016%" y="500" width="0.2004%" height="15" fill="rgb(220,39,43)" fg:x="8" fg:w="2"/><text x="1.0516%" y="510.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (2 samples, 0.20%)</title><rect x="0.8016%" y="516" width="0.2004%" height="15" fill="rgb(229,68,48)" fg:x="8" fg:w="2"/><text x="1.0516%" y="526.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (2 samples, 0.20%)</title><rect x="0.8016%" y="532" width="0.2004%" height="15" fill="rgb(252,8,32)" fg:x="8" fg:w="2"/><text x="1.0516%" y="542.50"></text></g><g><title>&lt;module&gt; (importlib/metadata/__init__.py:7) (1 samples, 0.10%)</title><rect x="0.9018%" y="548" width="0.1002%" height="15" fill="rgb(223,20,43)" fg:x="9" fg:w="1"/><text x="1.1518%" y="558.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.9018%" y="564" width="0.1002%" height="15" fill="rgb(229,81,49)" fg:x="9" fg:w="1"/><text x="1.1518%" y="574.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.9018%" y="580" width="0.1002%" height="15" fill="rgb(236,28,36)" fg:x="9" fg:w="1"/><text x="1.1518%" y="590.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.9018%" y="596" width="0.1002%" height="15" fill="rgb(249,185,26)" fg:x="9" fg:w="1"/><text x="1.1518%" y="606.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.9018%" y="612" width="0.1002%" height="15" fill="rgb(249,174,33)" fg:x="9" fg:w="1"/><text x="1.1518%" y="622.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.9018%" y="628" width="0.1002%" height="15" fill="rgb(233,201,37)" fg:x="9" fg:w="1"/><text x="1.1518%" y="638.50"></text></g><g><title>&lt;module&gt; (pathlib.py:14) (1 samples, 0.10%)</title><rect x="0.9018%" y="644" width="0.1002%" height="15" fill="rgb(221,78,26)" fg:x="9" fg:w="1"/><text x="1.1518%" y="654.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.9018%" y="660" width="0.1002%" height="15" fill="rgb(250,127,30)" fg:x="9" fg:w="1"/><text x="1.1518%" y="670.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.9018%" y="676" width="0.1002%" height="15" fill="rgb(230,49,44)" fg:x="9" fg:w="1"/><text x="1.1518%" y="686.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.9018%" y="692" width="0.1002%" height="15" fill="rgb(229,67,23)" fg:x="9" fg:w="1"/><text x="1.1518%" y="702.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:883) (1 samples, 0.10%)</title><rect x="0.9018%" y="708" width="0.1002%" height="15" fill="rgb(249,83,47)" fg:x="9" fg:w="1"/><text x="1.1518%" y="718.50"></text></g><g><title>_call_with_frames_removed (&lt;frozen importlib._bootstrap&gt;:241) (1 samples, 0.10%)</title><rect x="0.9018%" y="724" width="0.1002%" height="15" fill="rgb(215,43,3)" fg:x="9" fg:w="1"/><text x="1.1518%" y="734.50"></text></g><g><title>&lt;module&gt; (urllib/parse.py:39) (1 samples, 0.10%)</title><rect x="0.9018%" y="740" width="0.1002%" height="15" fill="rgb(238,154,13)" fg:x="9" fg:w="1"/><text x="1.1518%" y="750.50"></text></g><g><title>_find_and_load (&lt;frozen importlib._bootstrap&gt;:1027) (1 samples, 0.10%)</title><rect x="0.9018%" y="756" width="0.1002%" height="15" fill="rgb(219,56,2)" fg:x="9" fg:w="1"/><text x="1.1518%" y="766.50"></text></g><g><title>_find_and_load_unlocked (&lt;frozen importlib._bootstrap&gt;:1006) (1 samples, 0.10%)</title><rect x="0.9018%" y="772" width="0.1002%" height="15" fill="rgb(233,0,4)" fg:x="9" fg:w="1"/><text x="1.1518%" y="782.50"></text></g><g><title>_load_unlocked (&lt;frozen importlib._bootstrap&gt;:688) (1 samples, 0.10%)</title><rect x="0.9018%" y="788" width="0.1002%" height="15" fill="rgb(235,30,7)" fg:x="9" fg:w="1"/><text x="1.1518%" y="798.50"></text></g><g><title>exec_module (&lt;frozen importlib._bootstrap_external&gt;:879) (1 samples, 0.10%)</title><rect x="0.9018%" y="804" width="0.1002%" height="15" fill="rgb(250,79,13)" fg:x="9" fg:w="1"/><text x="1.1518%" y="814.50"></text></g><g><title>get_code (&lt;frozen importlib._bootstrap_external&gt;:1015) (1 samples, 0.10%)</title><rect x="0.9018%" y="820" width="0.1002%" height="15" fill="rgb(211,146,34)" fg:x="9" fg:w="1"/><text x="1.1518%" y="830.50"></text></g><g><title>_compile_bytecode (&lt;frozen importlib._bootstrap_external&gt;:672) (1 samples, 0.10%)</title><rect x="0.9018%" y="836" width="0.1002%" height="15" fill="rgb(228,22,38)" fg:x="9" fg:w="1"/><text x="1.1518%" y="846.50"></text></g><g><title>encrypt (pyaes/aes.py:566) (3 samples, 0.30%)</title><rect x="1.1022%" y="100" width="0.3006%" height="15" fill="rgb(235,168,5)" fg:x="11" fg:w="3"/><text x="1.3522%" y="110.50"></text></g><g><title>encrypt (pyaes/aes.py:214) (33 samples, 3.31%)</title><rect x="1.9038%" y="116" width="3.3066%" height="15" fill="rgb(221,155,16)" fg:x="19" fg:w="33"/><text x="2.1538%" y="126.50">enc..</text></g><g><title>&lt;listcomp&gt; (pyaes/aes.py:214) (25 samples, 2.51%)</title><rect x="2.7054%" y="132" width="2.5050%" height="15" fill="rgb(215,215,53)" fg:x="27" fg:w="25"/><text x="2.9554%" y="142.50">&lt;l..</text></g><g><title>_compact_word (pyaes/aes.py:62) (8 samples, 0.80%)</title><rect x="4.4088%" y="148" width="0.8016%" height="15" fill="rgb(223,4,10)" fg:x="44" fg:w="8"/><text x="4.6588%" y="158.50"></text></g><g><title>encrypt (pyaes/aes.py:217) (3 samples, 0.30%)</title><rect x="5.2104%" y="116" width="0.3006%" height="15" fill="rgb(234,103,6)" fg:x="52" fg:w="3"/><text x="5.4604%" y="126.50"></text></g><g><title>encrypt (pyaes/aes.py:218) (14 samples, 1.40%)</title><rect x="5.5110%" y="116" width="1.4028%" height="15" fill="rgb(227,97,0)" fg:x="55" fg:w="14"/><text x="5.7610%" y="126.50"></text></g><g><title>encrypt (pyaes/aes.py:219) (110 samples, 11.02%)</title><rect x="6.9138%" y="116" width="11.0220%" height="15" fill="rgb(234,150,53)" fg:x="69" fg:w="110"/><text x="7.1638%" y="126.50">encrypt (pyaes/a..</text></g><g><title>encrypt (pyaes/aes.py:220) (72 samples, 7.21%)</title><rect x="17.9359%" y="116" width="7.2144%" height="15" fill="rgb(228,201,54)" fg:x="179" fg:w="72"/><text x="18.1859%" y="126.50">encrypt (p..</text></g><g><title>encrypt (pyaes/aes.py:221) (73 samples, 7.31%)</title><rect x="25.1503%" y="116" width="7.3146%" height="15" fill="rgb(222,22,37)" fg:x="251" fg:w="73"/><text x="25.4003%" y="126.50">encrypt (p..</text></g><g><title>encrypt (pyaes/aes.py:222) (67 samples, 6.71%)</title><rect x="32.4649%" y="116" width="6.7134%" height="15" fill="rgb(237,53,32)" fg:x="324" fg:w="67"/><text x="32.7149%" y="126.50">encrypt (..</text></g><g><title>encrypt (pyaes/aes.py:223) (12 samples, 1.20%)</title><rect x="39.1784%" y="116" width="1.2024%" height="15" fill="rgb(233,25,53)" fg:x="391" fg:w="12"/><text x="39.4284%" y="126.50"></text></g><g><title>copy (copy.py:72) (3 samples, 0.30%)</title><rect x="41.6834%" y="132" width="0.3006%" height="15" fill="rgb(210,40,34)" fg:x="416" fg:w="3"/><text x="41.9334%" y="142.50"></text></g><g><title>copy (copy.py:74) (4 samples, 0.40%)</title><rect x="41.9840%" y="132" width="0.4008%" height="15" fill="rgb(241,220,44)" fg:x="419" fg:w="4"/><text x="42.2340%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:224) (26 samples, 2.61%)</title><rect x="40.3808%" y="116" width="2.6052%" height="15" fill="rgb(235,28,35)" fg:x="403" fg:w="26"/><text x="40.6308%" y="126.50">en..</text></g><g><title>copy (copy.py:76) (6 samples, 0.60%)</title><rect x="42.3848%" y="132" width="0.6012%" height="15" fill="rgb(210,56,17)" fg:x="423" fg:w="6"/><text x="42.6348%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:228) (1 samples, 0.10%)</title><rect x="42.9860%" y="116" width="0.1002%" height="15" fill="rgb(224,130,29)" fg:x="429" fg:w="1"/><text x="43.2360%" y="126.50"></text></g><g><title>encrypt (pyaes/aes.py:230) (17 samples, 1.70%)</title><rect x="43.0862%" y="116" width="1.7034%" height="15" fill="rgb(235,212,8)" fg:x="430" fg:w="17"/><text x="43.3362%" y="126.50"></text></g><g><title>encrypt (pyaes/aes.py:231) (22 samples, 2.20%)</title><rect x="44.7896%" y="116" width="2.2044%" height="15" fill="rgb(223,33,50)" fg:x="447" fg:w="22"/><text x="45.0396%" y="126.50">e..</text></g><g><title>encrypt (pyaes/aes.py:232) (15 samples, 1.50%)</title><rect x="46.9940%" y="116" width="1.5030%" height="15" fill="rgb(219,149,13)" fg:x="469" fg:w="15"/><text x="47.2440%" y="126.50"></text></g><g><title>encrypt (pyaes/aes.py:567) (487 samples, 48.80%)</title><rect x="1.4028%" y="100" width="48.7976%" height="15" fill="rgb(250,156,29)" fg:x="14" fg:w="487"/><text x="1.6528%" y="110.50">encrypt (pyaes/aes.py:567)</text></g><g><title>encrypt (pyaes/aes.py:233) (17 samples, 1.70%)</title><rect x="48.4970%" y="116" width="1.7034%" height="15" fill="rgb(216,193,19)" fg:x="484" fg:w="17"/><text x="48.7470%" y="126.50"></text></g><g><title>increment (pyaes/aes.py:288) (2 samples, 0.20%)</title><rect x="50.3006%" y="116" width="0.2004%" height="15" fill="rgb(216,135,14)" fg:x="502" fg:w="2"/><text x="50.5506%" y="126.50"></text></g><g><title>encrypt (pyaes/aes.py:568) (4 samples, 0.40%)</title><rect x="50.2004%" y="100" width="0.4008%" height="15" fill="rgb(241,47,5)" fg:x="501" fg:w="4"/><text x="50.4504%" y="110.50"></text></g><g><title>increment (pyaes/aes.py:289) (1 samples, 0.10%)</title><rect x="50.5010%" y="116" width="0.1002%" height="15" fill="rgb(233,42,35)" fg:x="504" fg:w="1"/><text x="50.7510%" y="126.50"></text></g><g><title>bench_pyaes (run_benchmark.py:25) (509 samples, 51.00%)</title><rect x="1.0020%" y="84" width="51.0020%" height="15" fill="rgb(231,13,6)" fg:x="10" fg:w="509"/><text x="1.2520%" y="94.50">bench_pyaes (run_benchmark.py:25)</text></g><g><title>encrypt (pyaes/aes.py:572) (14 samples, 1.40%)</title><rect x="50.6012%" y="100" width="1.4028%" height="15" fill="rgb(207,181,40)" fg:x="505" fg:w="14"/><text x="50.8512%" y="110.50"></text></g><g><title>&lt;listcomp&gt; (pyaes/aes.py:572) (14 samples, 1.40%)</title><rect x="50.6012%" y="116" width="1.4028%" height="15" fill="rgb(254,173,49)" fg:x="505" fg:w="14"/><text x="50.8512%" y="126.50"></text></g><g><title>encrypt (pyaes/aes.py:566) (1 samples, 0.10%)</title><rect x="52.0040%" y="116" width="0.1002%" height="15" fill="rgb(221,1,38)" fg:x="519" fg:w="1"/><text x="52.2540%" y="126.50"></text></g><g><title>encrypt (pyaes/aes.py:211) (1 samples, 0.10%)</title><rect x="52.7054%" y="132" width="0.1002%" height="15" fill="rgb(206,124,46)" fg:x="526" fg:w="1"/><text x="52.9554%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:214) (22 samples, 2.20%)</title><rect x="52.8056%" y="132" width="2.2044%" height="15" fill="rgb(249,21,11)" fg:x="527" fg:w="22"/><text x="53.0556%" y="142.50">e..</text></g><g><title>&lt;listcomp&gt; (pyaes/aes.py:214) (16 samples, 1.60%)</title><rect x="53.4068%" y="148" width="1.6032%" height="15" fill="rgb(222,201,40)" fg:x="533" fg:w="16"/><text x="53.6568%" y="158.50"></text></g><g><title>_compact_word (pyaes/aes.py:62) (7 samples, 0.70%)</title><rect x="54.3086%" y="164" width="0.7014%" height="15" fill="rgb(235,61,29)" fg:x="542" fg:w="7"/><text x="54.5586%" y="174.50"></text></g><g><title>encrypt (pyaes/aes.py:217) (2 samples, 0.20%)</title><rect x="55.0100%" y="132" width="0.2004%" height="15" fill="rgb(219,207,3)" fg:x="549" fg:w="2"/><text x="55.2600%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:218) (20 samples, 2.00%)</title><rect x="55.2104%" y="132" width="2.0040%" height="15" fill="rgb(222,56,46)" fg:x="551" fg:w="20"/><text x="55.4604%" y="142.50">e..</text></g><g><title>encrypt (pyaes/aes.py:219) (124 samples, 12.42%)</title><rect x="57.2144%" y="132" width="12.4248%" height="15" fill="rgb(239,76,54)" fg:x="571" fg:w="124"/><text x="57.4644%" y="142.50">encrypt (pyaes/aes...</text></g><g><title>encrypt (pyaes/aes.py:220) (82 samples, 8.22%)</title><rect x="69.6393%" y="132" width="8.2164%" height="15" fill="rgb(231,124,27)" fg:x="695" fg:w="82"/><text x="69.8893%" y="142.50">encrypt (py..</text></g><g><title>encrypt (pyaes/aes.py:221) (65 samples, 6.51%)</title><rect x="77.8557%" y="132" width="6.5130%" height="15" fill="rgb(249,195,6)" fg:x="777" fg:w="65"/><text x="78.1057%" y="142.50">encrypt (..</text></g><g><title>encrypt (pyaes/aes.py:222) (57 samples, 5.71%)</title><rect x="84.3687%" y="132" width="5.7114%" height="15" fill="rgb(237,174,47)" fg:x="842" fg:w="57"/><text x="84.6187%" y="142.50">encrypt..</text></g><g><title>encrypt (pyaes/aes.py:223) (12 samples, 1.20%)</title><rect x="90.0802%" y="132" width="1.2024%" height="15" fill="rgb(206,201,31)" fg:x="899" fg:w="12"/><text x="90.3302%" y="142.50"></text></g><g><title>copy (copy.py:74) (6 samples, 0.60%)</title><rect x="92.3848%" y="148" width="0.6012%" height="15" fill="rgb(231,57,52)" fg:x="922" fg:w="6"/><text x="92.6348%" y="158.50"></text></g><g><title>copy (copy.py:75) (1 samples, 0.10%)</title><rect x="92.9860%" y="148" width="0.1002%" height="15" fill="rgb(248,177,22)" fg:x="928" fg:w="1"/><text x="93.2360%" y="158.50"></text></g><g><title>encrypt (pyaes/aes.py:224) (20 samples, 2.00%)</title><rect x="91.2826%" y="132" width="2.0040%" height="15" fill="rgb(215,211,37)" fg:x="911" fg:w="20"/><text x="91.5326%" y="142.50">e..</text></g><g><title>copy (copy.py:76) (2 samples, 0.20%)</title><rect x="93.0862%" y="148" width="0.2004%" height="15" fill="rgb(241,128,51)" fg:x="929" fg:w="2"/><text x="93.3362%" y="158.50"></text></g><g><title>encrypt (pyaes/aes.py:230) (17 samples, 1.70%)</title><rect x="93.2866%" y="132" width="1.7034%" height="15" fill="rgb(227,165,31)" fg:x="931" fg:w="17"/><text x="93.5366%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:231) (14 samples, 1.40%)</title><rect x="94.9900%" y="132" width="1.4028%" height="15" fill="rgb(228,167,24)" fg:x="948" fg:w="14"/><text x="95.2400%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:232) (16 samples, 1.60%)</title><rect x="96.3928%" y="132" width="1.6032%" height="15" fill="rgb(228,143,12)" fg:x="962" fg:w="16"/><text x="96.6428%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:233) (4 samples, 0.40%)</title><rect x="97.9960%" y="132" width="0.4008%" height="15" fill="rgb(249,149,8)" fg:x="978" fg:w="4"/><text x="98.2460%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:567) (463 samples, 46.39%)</title><rect x="52.1042%" y="116" width="46.3928%" height="15" fill="rgb(243,35,44)" fg:x="520" fg:w="463"/><text x="52.3542%" y="126.50">encrypt (pyaes/aes.py:567)</text></g><g><title>encrypt (pyaes/aes.py:235) (1 samples, 0.10%)</title><rect x="98.3968%" y="132" width="0.1002%" height="15" fill="rgb(246,89,9)" fg:x="982" fg:w="1"/><text x="98.6468%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:568) (5 samples, 0.50%)</title><rect x="98.4970%" y="116" width="0.5010%" height="15" fill="rgb(233,213,13)" fg:x="983" fg:w="5"/><text x="98.7470%" y="126.50"></text></g><g><title>increment (pyaes/aes.py:288) (2 samples, 0.20%)</title><rect x="98.7976%" y="132" width="0.2004%" height="15" fill="rgb(233,141,41)" fg:x="986" fg:w="2"/><text x="99.0476%" y="142.50"></text></g><g><title>encrypt (pyaes/aes.py:572) (9 samples, 0.90%)</title><rect x="98.9980%" y="116" width="0.9018%" height="15" fill="rgb(239,167,4)" fg:x="988" fg:w="9"/><text x="99.2480%" y="126.50"></text></g><g><title>&lt;listcomp&gt; (pyaes/aes.py:572) (9 samples, 0.90%)</title><rect x="98.9980%" y="132" width="0.9018%" height="15" fill="rgb(209,217,16)" fg:x="988" fg:w="9"/><text x="99.2480%" y="142.50"></text></g><g><title>all (998 samples, 100%)</title><rect x="0.0000%" y="52" width="100.0000%" height="15" fill="rgb(219,88,35)" fg:x="0" fg:w="998"/><text x="0.2500%" y="62.50"></text></g><g><title>&lt;module&gt; (profile_wrapper.py:4) (988 samples, 99.00%)</title><rect x="1.0020%" y="68" width="98.9980%" height="15" fill="rgb(220,193,23)" fg:x="10" fg:w="988"/><text x="1.2520%" y="78.50">&lt;module&gt; (profile_wrapper.py:4)</text></g><g><title>bench_pyaes (run_benchmark.py:29) (479 samples, 48.00%)</title><rect x="52.0040%" y="84" width="47.9960%" height="15" fill="rgb(230,90,52)" fg:x="519" fg:w="479"/><text x="52.2540%" y="94.50">bench_pyaes (run_benchmark.py:29)</text></g><g><title>decrypt (pyaes/aes.py:579) (479 samples, 48.00%)</title><rect x="52.0040%" y="100" width="47.9960%" height="15" fill="rgb(252,106,19)" fg:x="519" fg:w="479"/><text x="52.2540%" y="110.50">decrypt (pyaes/aes.py:579)</text></g><g><title>encrypt (pyaes/aes.py:575) (1 samples, 0.10%)</title><rect x="99.8998%" y="116" width="0.1002%" height="15" fill="rgb(206,74,20)" fg:x="997" fg:w="1"/><text x="100.1498%" y="126.50"></text></g><g><title>_bytes_to_string (pyaes/aes.py:88) (1 samples, 0.10%)</title><rect x="99.8998%" y="132" width="0.1002%" height="15" fill="rgb(230,138,44)" fg:x="997" fg:w="1"/><text x="100.1498%" y="142.50"></text></g></svg></svg>
